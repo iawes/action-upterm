@@ -2,6 +2,9 @@ import os from "os"
 import fs from "fs"
 import path from "path"
 import * as core from "@actions/core"
+import * as github from "@actions/github"
+import { Octokit } from "@octokit/rest"
+const { createActionAuth } = require("@octokit/auth-action");
 
 import { execShellCommand } from "./helpers"
 
@@ -16,7 +19,7 @@ export async function run() {
 
     core.debug("Installing dependencies")
     if (process.platform == "linux") {
-      await execShellCommand("curl -sL https://github.com/owenthereal/upterm/releases/download/0.5.2/linux-amd64-v0.5.2.tar.gz | tar zxvf - --strip-components=1 -C /tmp && sudo install /tmp/upterm /usr/local/bin/")
+      await execShellCommand("curl -sL https://github.com/owenthereal/upterm/releases/download/v0.6.7/upterm_linux_amd64.tar.gz | tar zxvf - -C /tmp upterm && sudo install /tmp/upterm /usr/local/bin/")
       await execShellCommand("sudo apt-get -y install tmux")
     } else {
       await execShellCommand("brew install owenthereal/upterm/upterm")
@@ -24,14 +27,20 @@ export async function run() {
     }
     core.debug("Installed dependencies successfully")
 
-    core.debug("Generating SSH keys")
-    fs.mkdirSync(path.join(os.homedir(), ".ssh"), { recursive: true })
-    try {
-      await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
-    } catch { }    
-    core.debug("Generated SSH keys successfully")
+    const sshPath = path.join(os.homedir(), ".ssh")
+    if (!fs.existsSync(path.join(sshPath, "id_rsa"))) {
+      core.debug("Generating SSH keys")
+      fs.mkdirSync(sshPath, { recursive: true })
+      try {
+        await execShellCommand(`ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa; ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519`);
+      } catch { }    
+      core.debug("Generated SSH keys successfully")
+    } else {
+      core.debug("SSH key already exists")
+    }
+
     core.debug("Configuring ssh client")
-    fs.appendFileSync(path.join(os.homedir(), ".ssh/config"), "Host *\nStrictHostKeyChecking no\nCheckHostIP no\n" +
+    fs.appendFileSync(path.join(sshPath, "config"), "Host *\nStrictHostKeyChecking no\nCheckHostIP no\n" +
       "TCPKeepAlive yes\nServerAliveInterval 30\nServerAliveCountMax 180\nVerifyHostKeyDNS yes\nUpdateHostKeys yes\n")
     // entry in known hosts file in mandatory in upterm. attempt ssh connection to upterm server
     // to get the host key added to ~/.ssh/known_hosts
@@ -42,14 +51,53 @@ export async function run() {
     try {
       await execShellCommand('cat <(cat ~/.ssh/known_hosts | awk \'{ print "@cert-authority * " $2 " " $3 }\') >> ~/.ssh/known_hosts')
     } catch { }
-    core.debug("Creating new session")
-    await execShellCommand("tmux new -d -s upterm-wrapper -x 132 -y 43 \"upterm host --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43\"")
-    await new Promise(r => setTimeout(r, 2000))
+
+    let authorizedKeysParameter = ""
+
+    let allowedUsers = core.getInput("limit-access-to-users").split(/[\s\n,]+/).filter(x => x !== "")
+    if (core.getInput("limit-access-to-actor") === "true") {
+      core.info(`Adding actor "${github.context.actor}" to allowed users.`)
+      allowedUsers.push(github.context.actor)
+    }
+    const uniqueAllowedUsers = [...new Set(allowedUsers)]
+    if (uniqueAllowedUsers.length > 0) {
+      core.info(`Fetching SSH keys registered with GitHub profiles: ${uniqueAllowedUsers.join(', ')}`)
+      const octokit = new Octokit({
+        authStrategy: createActionAuth
+      })
+      let allowedKeys = []
+      for (const allowedUser of uniqueAllowedUsers) {
+        if (allowedUser) {
+          try {
+            let keys = await octokit.users.listPublicKeysForUser({
+              username: allowedUser
+            })
+            for (const item of keys.data) {
+              allowedKeys.push(item.key)
+            }
+          } catch (error) {
+            core.info(`Error fetching keys for ${allowedUser}. Error: ${error.message}`)
+          }
+        }
+      }
+      if (allowedKeys.length === 0) {
+        throw new Error(`No public SSH keys registered with GitHub profiles: ${uniqueAllowedUsers.join(', ')}`)
+      }
+      core.info(`Fetched ${allowedKeys.length} ssh public keys`)
+      const authorizedKeysPath = path.join(sshPath, "authorized_keys")
+      fs.appendFileSync(authorizedKeysPath, allowedKeys.join('\n'))
+      authorizedKeysParameter = `-a "${authorizedKeysPath}"`
+    }
+
+    const uptermServer = core.getInput("upterm-server")
+    core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`)
+    await execShellCommand(`tmux new -d -s upterm-wrapper -x 132 -y 43 \"upterm host --server '${uptermServer}' ${authorizedKeysParameter} --force-command 'tmux attach -t upterm' -- tmux new -s upterm -x 132 -y 43\"`)
+    sleep(2000)
     await execShellCommand("tmux send-keys -t upterm-wrapper q C-m")
     console.debug("Created new session successfully")
 
     core.debug("Fetching connection strings")
-    await new Promise(r => setTimeout(r, 1000))
+    sleep(1000)
 
     console.debug("Entering main loop")
     while (true) {
@@ -65,7 +113,7 @@ export async function run() {
         core.info("Exiting debugging session because '/continue' file was created")
         break
       }
-      await sleep(5000)
+      await sleep(30000)
     }
   } catch (error) {
     core.setFailed(error.message);
